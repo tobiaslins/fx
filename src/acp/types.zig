@@ -418,6 +418,11 @@ pub fn writeSessionUsage(w: *std.Io.Writer, billing: session_usage.BillingSnapsh
     });
     if (billing.reasoning_tokens) |value| try w.print(",\"reasoningTokens\":{d}", .{value});
     if (billing.request_count) |value| try w.print(",\"requests\":{d}", .{value});
+    try w.writeAll("},\"estimated\":{\"source\":\"gateway_catalog\",\"scope\":\"tokens\"");
+    try w.print(",\"requests\":{d},\"unpricedRequests\":{d}", .{ billing.estimated_requests, billing.unestimated_requests });
+    if (billing.estimated_token_cost) |amount| {
+        try w.print(",\"cost\":{{\"amount\":{d},\"currency\":\"USD\"}}", .{amount});
+    }
     try w.writeAll("}}");
 }
 

@@ -448,6 +448,13 @@ contains `sessionId` and `usage`:
     "reasoningTokens": 5,
     "requests": 1,
     "billableWebSearchCalls": 0
+  },
+  "estimated": {
+    "source": "gateway_catalog",
+    "scope": "tokens",
+    "requests": 1,
+    "unpricedRequests": 0,
+    "cost": { "amount": 0.0007185, "currency": "USD" }
   }
 }
 ```
@@ -456,9 +463,33 @@ contains `sessionId` and `usage`:
 are pending. Input tokens include cache reads and writes; output tokens
 include reasoning. Do not add those breakdowns to the totals again.
 `reasoningTokens` and `requests` are omitted when the ledger cannot prove
-them. Costs come from provider billing records, not token-rate estimates.
+them. Confirmed costs come from provider billing records.
 These totals follow fx's session ledger; cosmetic title-generation calls
 are not included.
+
+`estimated.cost` covers only pending generations with enough token data and
+Gateway catalog pricing. Add it to `confirmed.cost` for an estimated session
+total, and label that total as estimated. Settlement removes each generation's
+estimate and replaces it with its confirmed charge, so the combined amount can
+decrease. Never add estimates to the confirmed ledger or accumulate successive
+snapshots.
+
+Estimates use USD-per-token catalog rates for uncached input, cache reads,
+cache writes, and output. Reasoning is already included in output. Context
+tiers use inclusive minimum and exclusive maximum bounds against total input
+tokens; fast requests require fast rates. Unknown counters are not zero: fx
+requires a complete input breakdown or enough data to derive the remainder.
+`estimated.requests` counts priced pending generations; `unpricedRequests`
+counts the remaining pending generations. `estimated.cost` is omitted when
+none can be priced. A known zero estimate is included.
+
+Catalog estimates exclude tool fees, regional surcharges, and provider-specific
+discounts. Routing can also change the final price. Each estimate is computed
+from the request's model and rates at completion and saved with the pending
+generation, so changing models or loading a session preserves earlier estimates.
+The rich usage checkpoint uses schema 4 and still reads schemas 2 and 3. Older
+fx builds may reject schema 4 checkpoints; preserve session files before
+downgrading. Requests without a recoverable generation ID remain unpriced.
 
 `billing` is `complete` when the ledger covers its tracked billable invocations,
 `pending` when known generations await settlement, `incomplete` when billing

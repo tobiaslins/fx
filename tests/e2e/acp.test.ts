@@ -1957,6 +1957,9 @@ describe("acp: model-independent", () => {
         const root = createIsolatedRoot("fx-acp-billing-");
         const firstId = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV";
         const secondId = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        const thirdId = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        const changedModel = "test/acp-priced-model";
+        const noEstimate = { source: "gateway_catalog", scope: "tokens", requests: 0, unpricedRequests: 0 };
         const hasContext = backend.suffix === "";
         const model = hasContext ? FAKE_GATEWAY_MODEL : "test/acp-usage";
         let allowSettlement = false;
@@ -1984,13 +1987,17 @@ describe("acp: model-independent", () => {
           },
         ]);
         const gateway = startFakeGateway(
-          [completion(firstId, "0.0123"), completion(secondId), held.response],
+          [completion(firstId, "0.0123"), completion(secondId), completion(thirdId), held.response],
           {
             models: [{
               id: model,
               type: "language",
               tags: ["tool-use"],
               ...(hasContext ? { context_window: 128_000 } : {}),
+              pricing: { input: "0.0003", output: "0.0015", input_cache_read: "0.00003", input_cache_write: "0.000375" },
+            }, {
+              id: changedModel, type: "language", tags: ["tool-use"],
+              pricing: { input: "0.0006", output: "0.003", input_cache_read: "0.00006", input_cache_write: "0.00075" },
             }],
             generationResponse(id) {
               if (!allowSettlement) return new Response("pending", { status: 404 });
@@ -2041,7 +2048,7 @@ describe("acp: model-independent", () => {
             expect(invalid.error.code).toBe(-32602);
           }
           expect(await query()).toMatchObject({
-            billing: "complete", pendingRequests: 0, activeRequests: 0,
+            billing: "complete", pendingRequests: 0, activeRequests: 0, estimated: noEstimate,
             confirmed: { cost: { amount: 0, currency: "USD" }, requests: 0 },
           });
           expect(gateway.requests).toHaveLength(0);
@@ -2056,7 +2063,7 @@ describe("acp: model-independent", () => {
             reasoningTokens: 5, requests: 1, billableWebSearchCalls: 0,
           };
           const firstSettled = {
-            billing: "complete", pendingRequests: 0, activeRequests: 0, confirmed,
+            billing: "complete", pendingRequests: 0, activeRequests: 0, confirmed, estimated: noEstimate,
           };
           // Exact stream billing can still be publishing to the profile ledger
           // when the prompt response is sent.
@@ -2079,6 +2086,7 @@ describe("acp: model-independent", () => {
           const second = await runPrompt(client, "Return the deferred usage fixture.", TIMEOUT);
           expect(second.promptResult.result._meta.fx.usage).toEqual({
             billing: "pending", pendingRequests: 1, activeRequests: 0, confirmed,
+            estimated: { ...noEstimate, requests: 1, cost: { amount: 0.07185, currency: "USD" } },
           });
           expect(await query()).toEqual(second.promptResult.result._meta.fx.usage);
           const pendingUpdate = second.messages.find((message) => message.params?.update?.sessionUpdate === "usage_update");
@@ -2086,19 +2094,37 @@ describe("acp: model-independent", () => {
             expect(pendingUpdate.params.update.cost).toBeUndefined();
             expect(pendingUpdate.params.update._meta.fx.usage.confirmed.cost).toEqual(confirmed.cost);
           }
+          // Persist the estimate with its generation, so changing models or
+          // reloading never reprices requests from an earlier turn.
+          const beforeReload = await query();
+          client.endStdin();
+          expect(await client.waitForExit()).toBe(0);
+          expect(client.stderr).toBe("");
+          client = await AcpClient.create(options);
+          await client.request("initialize", { protocolVersion: 1 });
+          await client.request("session/load", { sessionId, cwd: root.workspace, mcpServers: [] });
+          expect(await query()).toEqual(beforeReload);
+          const changed = await client.request("session/set_config_option", { sessionId, configId: "model", value: changedModel }) as any;
+          expect(changed.error).toBeUndefined();
+          await runPrompt(client, "Use the other model's catalog price.", TIMEOUT);
+          const changedUsage = await query();
+          expect(changedUsage.confirmed).toEqual(confirmed);
+          expect(changedUsage.estimated.requests).toBe(2);
+          expect(changedUsage.estimated.cost.amount).toBeCloseTo(0.07185 + 0.1437, 10);
+          expect(changedUsage.pendingRequests).toBe(2);
           // The prompt has ended. Only background billing settlement can change these totals.
           allowSettlement = true;
           const settled = await waitForSettlement();
           expect(settled).toEqual({
-            billing: "complete", pendingRequests: 0, activeRequests: 0,
+            billing: "complete", pendingRequests: 0, activeRequests: 0, estimated: noEstimate,
             confirmed: {
-              cost: { amount: 0.0246, currency: "USD" },
-              inputTokens: 260, outputTokens: 50,
-              cacheReadTokens: 40, cacheWriteTokens: 20,
-              reasoningTokens: 10, requests: 2, billableWebSearchCalls: 0,
+              cost: { amount: 0.0369, currency: "USD" },
+              inputTokens: 390, outputTokens: 75,
+              cacheReadTokens: 60, cacheWriteTokens: 30,
+              reasoningTokens: 15, requests: 3, billableWebSearchCalls: 0,
             },
           });
-          expect(gateway.requests).toHaveLength(2);
+          expect(gateway.requests).toHaveLength(3);
           expect(gateway.generationRequests.length).toBeGreaterThan(0);
 
           client.endStdin();
@@ -2113,7 +2139,7 @@ describe("acp: model-independent", () => {
           client.send({ jsonrpc: "2.0", id: 333, method: "session/prompt", params: {
             prompt: [{ type: "text", text: "Hold this request open." }],
           } });
-          await waitForCondition("held usage request", () => gateway.requests.length === 3, 5_000);
+          await waitForCondition("held usage request", () => gateway.requests.length === 4, 5_000);
           expect(await query()).toEqual({ ...settled, billing: "incomplete", activeRequests: 1 });
           held.release("Finished without billing identity.");
           let finished: any;
