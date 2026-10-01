@@ -39,6 +39,22 @@ pub const Availability = enum {
     legacy,
 };
 
+/// A credential-free view of the session's settled billing records. Counters
+/// exclude pending requests; `billing` describes whether they cover the session.
+pub const BillingSnapshot = struct {
+    billing: Availability,
+    pending_requests: usize,
+    active_requests: usize,
+    total_cost: f64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    reasoning_tokens: ?u64,
+    request_count: ?u64,
+    billable_web_search_calls: u64,
+};
+
 /// Billing consequence of one logical Gateway invocation across retries.
 pub const DeliveryOutcome = enum {
     /// Delivery was proven not to create a billable generation.
@@ -1602,6 +1618,26 @@ pub const Usage = struct {
         used: u64,
         complete_cost: ?f64,
     };
+
+    /// Copies counters under the ledger lock without allocating, joining a
+    /// worker, or starting reconciliation. Safe to read during a provider call.
+    pub fn billingSnapshot(self: *Usage) BillingSnapshot {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        return .{
+            .billing = if (self.active_sequence_count > 0) .incomplete else self.billing,
+            .pending_requests = self.pending.items.len,
+            .active_requests = self.active_sequence_count,
+            .total_cost = self.total_cost,
+            .input_tokens = self.input_tokens,
+            .output_tokens = self.output_tokens,
+            .cache_read_tokens = self.cache_read_tokens,
+            .cache_write_tokens = self.cache_write_tokens,
+            .reasoning_tokens = self.reasoning_tokens,
+            .request_count = self.request_count,
+            .billable_web_search_calls = self.billable_web_search_calls,
+        };
+    }
 
     /// Returns the latest provider-reported context usage. This state is
     /// intentionally runtime-only: a restored billing aggregate cannot prove
@@ -3608,6 +3644,61 @@ fn exactUsageOrigin(provider: model_provider.ProviderId) []const u8 {
         .grok => "exact/grok",
         .configured => "exact/configured",
     };
+}
+
+test "billing snapshot retains confirmed totals through pending and incomplete calls" {
+    const alloc = std.testing.allocator;
+    var usage = Usage.initFresh();
+    defer usage.deinit(alloc);
+    const first = try InvocationObservation.begin(&usage);
+    try std.testing.expectEqual(Availability.incomplete, usage.billingSnapshot().billing);
+    try std.testing.expectEqual(@as(usize, 1), usage.billingSnapshot().active_requests);
+    try first.complete(alloc, .{
+        .generation_id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        .billing = .{
+            .created_at_ms = 1_700_000_000_000,
+            .model = "provider/model",
+            .total_cost = 0.0123,
+            .input_tokens = 130,
+            .output_tokens = 25,
+            .cache_read_tokens = 20,
+            .cache_write_tokens = 10,
+            .reasoning_tokens = 5,
+            .billable_web_search_calls = 2,
+        },
+    }, .{ .exact = .gateway });
+    const confirmed = usage.billingSnapshot();
+    try std.testing.expectEqual(Availability.complete, confirmed.billing);
+    try std.testing.expectEqual(@as(usize, 0), confirmed.active_requests);
+    try std.testing.expectEqual(@as(?u64, 1), confirmed.request_count);
+    try std.testing.expectEqual(@as(u64, 130), confirmed.input_tokens);
+    try std.testing.expectEqual(@as(u64, 25), confirmed.output_tokens);
+    try std.testing.expectEqual(@as(u64, 20), confirmed.cache_read_tokens);
+    try std.testing.expectEqual(@as(u64, 10), confirmed.cache_write_tokens);
+    try std.testing.expectEqual(@as(?u64, 5), confirmed.reasoning_tokens);
+    try std.testing.expectEqual(@as(u64, 2), confirmed.billable_web_search_calls);
+
+    const second = try InvocationObservation.begin(&usage);
+    const id = "gen_01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    try second.complete(alloc, .{ .generation_id = id }, testGatewayUsageOutcome(id, false));
+    const pending = usage.billingSnapshot();
+    try std.testing.expectEqual(Availability.pending, pending.billing);
+    try std.testing.expectEqual(@as(usize, 1), pending.pending_requests);
+    try std.testing.expectEqual(confirmed.total_cost, pending.total_cost);
+    try std.testing.expectEqual(confirmed.input_tokens, pending.input_tokens);
+
+    const third = try InvocationObservation.begin(&usage);
+    try third.fail(.possibly_billed_without_identity);
+    const incomplete = usage.billingSnapshot();
+    try std.testing.expectEqual(Availability.incomplete, incomplete.billing);
+    try std.testing.expectEqual(@as(usize, 1), incomplete.pending_requests);
+    try std.testing.expectEqual(confirmed.total_cost, incomplete.total_cost);
+    try std.testing.expectEqual(@as(usize, 0), incomplete.active_requests);
+
+    var legacy = Usage.initLegacy();
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(Availability.legacy, legacy.billingSnapshot().billing);
+    try std.testing.expectEqual(@as(?u64, null), legacy.billingSnapshot().request_count);
 }
 
 test "live context usage keeps the newest completed provider observation" {

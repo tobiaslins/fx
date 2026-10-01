@@ -383,8 +383,8 @@ progress are not delivered to operations yet.
 
 ## ACP Embedding
 
-`fx acp` extends ACP v1 for clients that embed it. Extensions are read and
-written under `_meta.fx`.
+`fx acp` extends ACP v1 for clients that embed it. Extension metadata is read
+and written under `_meta.fx`; extension methods use the `_fx/` prefix.
 
 * **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
   are advertised on every turn within the `mcp_selected_schema_bytes` budget.
@@ -426,6 +426,62 @@ written under `_meta.fx`.
   project servers. Set `_meta.fx.profileMcpServers` to `true` on a session
   request to add the user's `~/.fx/mcp.json` servers. Request entries win name
   collisions, and profile entries win over project entries.
+
+### Session usage
+
+`initialize` advertises `agentCapabilities._meta.fx.sessionUsage: true`.
+Send `_fx/session/usage` with `{"sessionId":"<active-session-id>"}` to read
+the active session's billing snapshot, including during a prompt. The response
+contains `sessionId` and `usage`:
+
+```json
+{
+  "billing": "pending",
+  "pendingRequests": 1,
+  "activeRequests": 0,
+  "confirmed": {
+    "cost": { "amount": 0.0123, "currency": "USD" },
+    "inputTokens": 130,
+    "outputTokens": 25,
+    "cacheReadTokens": 20,
+    "cacheWriteTokens": 10,
+    "reasoningTokens": 5,
+    "requests": 1,
+    "billableWebSearchCalls": 0
+  }
+}
+```
+
+`confirmed` contains cumulative settled records, even when later requests
+are pending. Input tokens include cache reads and writes; output tokens
+include reasoning. Do not add those breakdowns to the totals again.
+`reasoningTokens` and `requests` are omitted when the ledger cannot prove
+them. Costs come from provider billing records, not token-rate estimates.
+These totals follow fx's session ledger; cosmetic title-generation calls
+are not included.
+
+`billing` is `complete` when the ledger covers its tracked billable invocations,
+`pending` when known generations await settlement, `incomplete` when billing
+coverage is uncertain or an invocation is active, and `legacy` for sessions
+that predate usage accounting. `pendingRequests` counts known generations
+awaiting settlement; `activeRequests` counts in-flight provider invocations.
+An incomplete session can have no pending requests, for example after a
+response without a recoverable generation identity. Zero confirmed cost
+does not mean the session was free unless billing is complete.
+
+The same snapshot appears in `_meta.fx.usage` on prompt responses and
+`usage_update` notifications. Standard `usage_update.cost` remains absent
+until billing is complete. Prompt response `usage` still contains the
+current turn's reported token counters, which can cover a different set of
+requests than the settled session totals. Missing provider counters are not
+proof of zero usage.
+
+Usage queries read existing state without starting provider requests or
+reconciliation. Poll to observe background settlement after a prompt; it
+does not send a new notification by itself. Queries work without context
+window metadata and after `session/load` or `session/resume`, but require
+the exact active session ID. Existing session persistence owns the ledger;
+clients do not need to read profile files.
 
 ## Permissions and Auto Mode
 
